@@ -2390,6 +2390,310 @@ io.on('connection', (socket) => {
     }
   });
 
+
+
+
+
+
+
+
+
+
+socket.on('delete_conversation', async (data) => {
+  try {
+    const { conversationId, userId } = data;
+    const conversationsCollection = db.collection('conversations');
+    const messagesCollection = db.collection('messages');
+
+    // Verify user has permission to delete this conversation
+    const conversation = await conversationsCollection.findOne({
+      _id: new ObjectId(conversationId),
+      $or: [
+        { customerId: userId },
+        { adminId: userId }
+      ]
+    });
+
+    if (!conversation) {
+      socket.emit('conversation_error', { message: 'Conversation not found or access denied' });
+      return;
+    }
+
+    if (conversation.isGroup) {
+      socket.emit('conversation_error', { message: 'Cannot delete group conversations' });
+      return;
+    }
+
+    // Delete all messages in this conversation
+    await messagesCollection.deleteMany({ conversationId: conversationId });
+
+    // Delete the conversation
+    await conversationsCollection.deleteOne({ _id: new ObjectId(conversationId) });
+
+    // Notify both users about the deletion
+    const targetUserIds = [conversation.adminId, conversation.customerId];
+    
+    onlineUsers.forEach((onlineUser, socketId) => {
+      if (targetUserIds.includes(onlineUser.userId)) {
+        io.to(socketId).emit('conversation_deleted', {
+          conversationId: conversationId
+        });
+      }
+    });
+
+    // Update conversations list for both users
+    updateConversationsForUsers(targetUserIds);
+
+    console.log(`✅ Conversation ${conversationId} deleted by user ${userId}`);
+
+  } catch (error) {
+    console.error('Delete conversation error:', error);
+    socket.emit('conversation_error', { message: 'Failed to delete conversation' });
+  }
+});
+
+// Block conversation
+socket.on('block_conversation', async (data) => {
+  try {
+    const { conversationId, userId } = data;
+    const conversationsCollection = db.collection('conversations');
+
+    // Verify user has permission to block this conversation
+    const conversation = await conversationsCollection.findOne({
+      _id: new ObjectId(conversationId),
+      $or: [
+        { customerId: userId },
+        { adminId: userId }
+      ]
+    });
+
+    if (!conversation) {
+      socket.emit('conversation_error', { message: 'Conversation not found or access denied' });
+      return;
+    }
+
+    if (conversation.isGroup) {
+      socket.emit('conversation_error', { message: 'Cannot block group conversations' });
+      return;
+    }
+
+    // Update conversation with blocked status
+    await conversationsCollection.updateOne(
+      { _id: new ObjectId(conversationId) },
+      { 
+        $set: { 
+          isBlocked: true,
+          blockedBy: userId,
+          blockedAt: new Date()
+        } 
+      }
+    );
+
+    // Notify both users about the block
+    const targetUserIds = [conversation.adminId, conversation.customerId];
+    
+    onlineUsers.forEach((onlineUser, socketId) => {
+      if (targetUserIds.includes(onlineUser.userId)) {
+        io.to(socketId).emit('conversation_blocked', {
+          conversationId: conversationId,
+          blockedBy: userId
+        });
+      }
+    });
+
+    // Update conversations list for both users
+    updateConversationsForUsers(targetUserIds);
+
+    console.log(`🚫 Conversation ${conversationId} blocked by user ${userId}`);
+
+  } catch (error) {
+    console.error('Block conversation error:', error);
+    socket.emit('conversation_error', { message: 'Failed to block conversation' });
+  }
+});
+
+// Unblock conversation
+socket.on('unblock_conversation', async (data) => {
+  try {
+    const { conversationId, userId } = data;
+    const conversationsCollection = db.collection('conversations');
+
+    // Verify user has permission to unblock this conversation
+    const conversation = await conversationsCollection.findOne({
+      _id: new ObjectId(conversationId),
+      $or: [
+        { customerId: userId },
+        { adminId: userId }
+      ]
+    });
+
+    if (!conversation) {
+      socket.emit('conversation_error', { message: 'Conversation not found or access denied' });
+      return;
+    }
+
+    // Update conversation to remove blocked status
+    await conversationsCollection.updateOne(
+      { _id: new ObjectId(conversationId) },
+      { 
+        $set: { 
+          isBlocked: false 
+        },
+        $unset: {
+          blockedBy: "",
+          blockedAt: ""
+        }
+      }
+    );
+
+    // Notify both users about the unblock
+    const targetUserIds = [conversation.adminId, conversation.customerId];
+    
+    onlineUsers.forEach((onlineUser, socketId) => {
+      if (targetUserIds.includes(onlineUser.userId)) {
+        io.to(socketId).emit('conversation_unblocked', {
+          conversationId: conversationId,
+          unblockedBy: userId
+        });
+      }
+    });
+
+    // Update conversations list for both users
+    updateConversationsForUsers(targetUserIds);
+
+    console.log(`✅ Conversation ${conversationId} unblocked by user ${userId}`);
+
+  } catch (error) {
+    console.error('Unblock conversation error:', error);
+    socket.emit('conversation_error', { message: 'Failed to unblock conversation' });
+  }
+});
+
+
+
+
+// Delete message in personal chat
+socket.on('delete_message', async (data) => {
+  try {
+    const { conversationId, messageId, userId } = data;
+    const messagesCollection = db.collection('messages');
+    const conversationsCollection = db.collection('conversations');
+
+    // Find the message
+    const message = await messagesCollection.findOne({
+      _id: new ObjectId(messageId),
+      conversationId: conversationId
+    });
+
+    if (!message) {
+      socket.emit('message_error', { message: 'Message not found' });
+      return;
+    }
+
+    // Check if user has permission to delete this message
+    if (message.senderId !== userId) {
+      socket.emit('message_error', { message: 'You can only delete your own messages' });
+      return;
+    }
+
+    // Delete the message
+    await messagesCollection.deleteOne({ _id: new ObjectId(messageId) });
+
+    // Get conversation to notify both users
+    const conversation = await conversationsCollection.findOne({
+      _id: new ObjectId(conversationId)
+    });
+
+    if (conversation) {
+      // Notify both users in the conversation
+      const targetUserIds = [conversation.adminId, conversation.customerId];
+      
+      onlineUsers.forEach((onlineUser, socketId) => {
+        if (targetUserIds.includes(onlineUser.userId)) {
+          io.to(socketId).emit('message_deleted', {
+            conversationId: conversationId,
+            messageId: messageId
+          });
+        }
+      });
+    }
+
+    console.log(`🗑️ Message ${messageId} deleted by user ${userId}`);
+
+  } catch (error) {
+    console.error('Delete message error:', error);
+    socket.emit('message_error', { message: 'Failed to delete message' });
+  }
+});
+
+// Delete message in group chat
+socket.on('delete_group_message', async (data) => {
+  try {
+    const { groupId, messageId, userId } = data;
+    const messagesCollection = db.collection('messages');
+    const groupMembersCollection = db.collection('group_members');
+
+    // Find the message
+    const message = await messagesCollection.findOne({
+      _id: new ObjectId(messageId),
+      groupId: groupId
+    });
+
+    if (!message) {
+      socket.emit('message_error', { message: 'Message not found' });
+      return;
+    }
+
+    // Check if user is admin (only admin can delete messages in group)
+    const userMembership = await groupMembersCollection.findOne({
+      groupId: groupId,
+      userId: userId,
+      role: 'admin'
+    });
+
+    if (!userMembership) {
+      socket.emit('message_error', { message: 'Only admin can delete messages in group' });
+      return;
+    }
+
+    // Delete the message
+    await messagesCollection.deleteOne({ _id: new ObjectId(messageId) });
+
+    // Get all group members to notify them
+    const groupMembers = await groupMembersCollection.find({
+      groupId: groupId
+    }).toArray();
+
+    // Notify all group members
+    const memberSockets = getSocketsByUserIds(groupMembers.map(m => m.userId));
+    memberSockets.forEach(memberSocket => {
+      io.to(memberSocket.socketId).emit('group_message_deleted', {
+        groupId: groupId,
+        messageId: messageId
+      });
+    });
+
+    console.log(`🗑️ Group message ${messageId} deleted by admin ${userId}`);
+
+  } catch (error) {
+    console.error('Delete group message error:', error);
+    socket.emit('message_error', { message: 'Failed to delete message' });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   // Helper function to notify admin about new customer
   async function notifyAdminAboutNewCustomer(customer) {
     const admin = onlineUsers.get([...onlineUsers.entries()].find(([_, user]) => user.role === 'admin')?.[0]);
