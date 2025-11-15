@@ -1089,6 +1089,34 @@ app.use('/api/token', (req, res, next) => {
 // Store online users
 const onlineUsers = new Map();
 
+
+
+
+
+
+
+app.get('/api/app/version', (req, res) => {
+  res.json({
+    minVersion: 6, // Minimum required version
+    latestVersion: 7, // Latest available version
+    forceUpdate: true, // Whether update is mandatory
+    message: "Critical security update available. Please update to continue using the app.",
+    updateUrl: {
+      android: "https://play.google.com/store/apps/details?id=com.kubercabdriver",
+      ios: "https://apps.apple.com/app/idYOUR_APP_ID"
+    }
+  });
+});
+
+
+
+
+
+
+
+
+
+
 // File upload endpoint
 app.post('/upload', upload.single('image'), (req, res) => {
   try {
@@ -2694,6 +2722,316 @@ socket.on('delete_group_message', async (data) => {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Remove member from group (admin only)
+socket.on('remove_group_member', async (data) => {
+  try {
+    const { groupId, memberId } = data;
+    const user = onlineUsers.get(socket.id);
+    
+    if (!user || user.role !== 'admin') {
+      socket.emit('group_error', { message: 'Only admins can remove members' });
+      return;
+    }
+
+    const groupsCollection = db.collection('groups');
+    const groupMembersCollection = db.collection('group_members');
+    const conversationsCollection = db.collection('conversations');
+    const usersCollection = db.collection('users');
+
+    // Verify group exists and user is admin
+    const group = await groupsCollection.findOne({ 
+      _id: new ObjectId(groupId),
+      createdBy: user.userId
+    });
+
+    if (!group) {
+      socket.emit('group_error', { message: 'Group not found or access denied' });
+      return;
+    }
+
+    // Prevent admin from removing themselves
+    if (memberId === user.userId) {
+      socket.emit('group_error', { message: 'You cannot remove yourself from the group' });
+      return;
+    }
+
+    // Remove member from group_members collection
+    const deleteResult = await groupMembersCollection.deleteOne({
+      groupId: groupId,
+      userId: memberId
+    });
+
+    if (deleteResult.deletedCount === 0) {
+      socket.emit('group_error', { message: 'Member not found in group' });
+      return;
+    }
+
+    // Update group member count
+    await groupsCollection.updateOne(
+      { _id: new ObjectId(groupId) },
+      { 
+        $inc: { memberCount: -1 },
+        $set: { updatedAt: new Date() }
+      }
+    );
+
+    // Update conversation member count
+    await conversationsCollection.updateOne(
+      { groupId: groupId },
+      { 
+        $inc: { memberCount: -1 },
+        $set: { updatedAt: new Date() }
+      }
+    );
+
+    // Get member details for notification
+    const removedMember = await usersCollection.findOne({
+      _id: new ObjectId(memberId)
+    });
+
+    // Get all remaining group members
+    const remainingMembers = await groupMembersCollection.find({
+      groupId: groupId
+    }).toArray();
+
+    // Notify all remaining group members
+    const memberSockets = getSocketsByUserIds(remainingMembers.map(m => m.userId));
+    memberSockets.forEach(memberSocket => {
+      io.to(memberSocket.socketId).emit('group_member_removed', {
+        groupId: groupId,
+        removedMemberId: memberId,
+        removedMemberName: removedMember?.username || 'User',
+        removedBy: user.username,
+        newMemberCount: group.memberCount - 1
+      });
+    });
+
+    // Notify the removed user
+    const removedUserSocket = getSocketsByUserIds([memberId]);
+    removedUserSocket.forEach(userSocket => {
+      io.to(userSocket.socketId).emit('removed_from_group', {
+        groupId: groupId,
+        groupName: group.name,
+        removedBy: user.username
+      });
+    });
+
+    // Update conversations for all remaining members
+    updateConversationsForUsers(remainingMembers.map(m => m.userId));
+
+    console.log(`✅ Member ${memberId} removed from group ${groupId} by admin ${user.userId}`);
+
+    socket.emit('member_removed_success', {
+      groupId: groupId,
+      removedMemberId: memberId
+    });
+
+  } catch (error) {
+    console.error('Remove group member error:', error);
+    socket.emit('group_error', { message: 'Failed to remove member' });
+  }
+});
+
+// User leaves group
+socket.on('leave_group', async (data) => {
+  try {
+    const { groupId } = data;
+    const user = onlineUsers.get(socket.id);
+    
+    if (!user) {
+      socket.emit('group_error', { message: 'User not found' });
+      return;
+    }
+
+    const groupsCollection = db.collection('groups');
+    const groupMembersCollection = db.collection('group_members');
+    const conversationsCollection = db.collection('conversations');
+
+    // Check if user is a member of the group
+    const userMembership = await groupMembersCollection.findOne({
+      groupId: groupId,
+      userId: user.userId
+    });
+
+    if (!userMembership) {
+      socket.emit('group_error', { message: 'You are not a member of this group' });
+      return;
+    }
+
+    // Prevent admin from leaving (they must delete the group instead)
+    if (userMembership.role === 'admin') {
+      socket.emit('group_error', { message: 'Admin cannot leave group. Please delete the group instead.' });
+      return;
+    }
+
+    // Remove user from group_members collection
+    await groupMembersCollection.deleteOne({
+      groupId: groupId,
+      userId: user.userId
+    });
+
+    // Update group member count
+    await groupsCollection.updateOne(
+      { _id: new ObjectId(groupId) },
+      { 
+        $inc: { memberCount: -1 },
+        $set: { updatedAt: new Date() }
+      }
+    );
+
+    // Update conversation member count
+    await conversationsCollection.updateOne(
+      { groupId: groupId },
+      { 
+        $inc: { memberCount: -1 },
+        $set: { updatedAt: new Date() }
+      }
+    );
+
+    // Get all remaining group members
+    const remainingMembers = await groupMembersCollection.find({
+      groupId: groupId
+    }).toArray();
+
+    // Notify remaining group members
+    const memberSockets = getSocketsByUserIds(remainingMembers.map(m => m.userId));
+    memberSockets.forEach(memberSocket => {
+      io.to(memberSocket.socketId).emit('group_member_left', {
+        groupId: groupId,
+        leftMemberId: user.userId,
+        leftMemberName: user.username,
+        newMemberCount: group.memberCount - 1
+      });
+    });
+
+    // Update conversations for remaining members
+    updateConversationsForUsers(remainingMembers.map(m => m.userId));
+
+    // Remove group from user's conversations
+    updateConversationsForUsers([user.userId]);
+
+    console.log(`✅ User ${user.userId} left group ${groupId}`);
+
+    socket.emit('left_group_success', {
+      groupId: groupId
+    });
+
+  } catch (error) {
+    console.error('Leave group error:', error);
+    socket.emit('group_error', { message: 'Failed to leave group' });
+  }
+});
+
+// Delete group (admin only)
+socket.on('delete_group', async (data) => {
+  try {
+    const { groupId } = data;
+    const user = onlineUsers.get(socket.id);
+    
+    if (!user || user.role !== 'admin') {
+      socket.emit('group_error', { message: 'Only admins can delete groups' });
+      return;
+    }
+
+    const groupsCollection = db.collection('groups');
+    const groupMembersCollection = db.collection('group_members');
+    const conversationsCollection = db.collection('conversations');
+    const messagesCollection = db.collection('messages');
+
+    // Verify group exists and user is the creator
+    const group = await groupsCollection.findOne({ 
+      _id: new ObjectId(groupId),
+      createdBy: user.userId
+    });
+
+    if (!group) {
+      socket.emit('group_error', { message: 'Group not found or access denied' });
+      return;
+    }
+
+    // Get all group members before deletion
+    const groupMembers = await groupMembersCollection.find({
+      groupId: groupId
+    }).toArray();
+
+    const memberIds = groupMembers.map(m => m.userId);
+
+    // Delete all related data in transaction
+    await Promise.all([
+      // Delete group
+      groupsCollection.deleteOne({ _id: new ObjectId(groupId) }),
+      // Delete group members
+      groupMembersCollection.deleteMany({ groupId: groupId }),
+      // Delete group conversation
+      conversationsCollection.deleteOne({ groupId: groupId }),
+      // Delete group messages
+      messagesCollection.deleteMany({ groupId: groupId })
+    ]);
+
+    // Notify all former group members
+    const memberSockets = getSocketsByUserIds(memberIds);
+    memberSockets.forEach(memberSocket => {
+      io.to(memberSocket.socketId).emit('group_deleted', {
+        groupId: groupId,
+        groupName: group.name,
+        deletedBy: user.username
+      });
+    });
+
+    // Update conversations for all former members
+    updateConversationsForUsers(memberIds);
+
+    console.log(`🗑️ Group ${groupId} deleted by admin ${user.userId}`);
+
+    socket.emit('group_deleted_success', {
+      groupId: groupId
+    });
+
+  } catch (error) {
+    console.error('Delete group error:', error);
+    socket.emit('group_error', { message: 'Failed to delete group' });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   // Helper function to notify admin about new customer
   async function notifyAdminAboutNewCustomer(customer) {
     const admin = onlineUsers.get([...onlineUsers.entries()].find(([_, user]) => user.role === 'admin')?.[0]);
@@ -2703,7 +3041,7 @@ socket.on('delete_group_message', async (data) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Group chat features enabled: Admin can create groups and add members`);
