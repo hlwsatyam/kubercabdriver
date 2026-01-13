@@ -227,6 +227,782 @@ app.get('/api/user-groups/:userId', async (req, res) => {
   }
 });
 
+
+
+
+
+
+
+
+app.post('/broadcast', async (req, res) => {
+  try {
+    const { message, title = "Important Announcement", imageUrl = null, priority = "high" } = req.body;
+    
+    if (!message) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Message content is required' 
+      });
+    }
+
+    const usersCollection = db.collection('users');
+    const messagesCollection = db.collection('broadcast_messages');
+    const conversationsCollection = db.collection('conversations');
+
+    // Get all users with FCM tokens
+    const users = await usersCollection.find({ 
+      fcmToken: { $exists: true, $ne: null } 
+    }).toArray();
+
+    // Create broadcast message record
+    const broadcastMessage = {
+      message: message,
+      title: title,
+      imageUrl: imageUrl,
+      priority: priority,
+      sentAt: new Date(),
+      sentBy: 'admin',
+      totalRecipients: users.length,
+      status: 'sent'
+    };
+
+    const messageResult = await messagesCollection.insertOne(broadcastMessage);
+    broadcastMessage._id = messageResult.insertedId;
+
+    // Send FCM notifications to all users
+    const fcmResults = [];
+    const failedTokens = [];
+
+    for (const user of users) {
+      try {
+        const messagePayload = {
+          token: user.fcmToken,
+          notification: {
+            title: title,
+            body: message,
+          },
+          data: {
+            type: 'broadcast',
+            messageId: String(broadcastMessage._id),
+            title: title,
+            message: message,
+            imageUrl: imageUrl || '',
+            sentAt: new Date().toISOString(),
+            click_action: 'FLUTTER_NOTIFICATION_CLICK'
+          },
+          android: {
+            priority: priority === "high" ? 'high' : 'normal',
+            notification: {
+              sound: 'default',
+              channelId: 'kubercab_broadcast_channel',
+              icon: 'ic_notification',
+              color: '#FF5722'
+            }
+          },
+          apns: {
+            payload: {
+              aps: {
+                sound: 'default',
+                badge: 1
+              }
+            }
+          },
+          webpush: {
+            notification: {
+              icon: 'https://your-domain.com/icon.png'
+            }
+          }
+        };
+
+        // Add image if provided
+        if (imageUrl) {
+          messagePayload.notification.image = imageUrl;
+          messagePayload.android.notification.imageUrl = imageUrl;
+          messagePayload.apns.payload.aps['mutable-content'] = 1;
+          messagePayload.apns.fcm_options = {
+            image: imageUrl
+          };
+        }
+
+        const response = await firebaseKuberCab.messaging().send(messagePayload);
+        fcmResults.push({
+          userId: user._id.toString(),
+          username: user.username,
+          success: true,
+          messageId: response
+        });
+
+        // Create individual conversation for each user to store broadcast message
+        const adminUser = await usersCollection.findOne({ role: 'admin' });
+        if (adminUser) {
+          // Find or create conversation between admin and user
+          let conversation = await conversationsCollection.findOne({
+            adminId: adminUser._id.toString(),
+            customerId: user._id.toString(),
+            type: 'individual'
+          });
+
+          if (!conversation) {
+            conversation = {
+              adminId: adminUser._id.toString(),
+              customerId: user._id.toString(),
+              customerUsername: user.username,
+              customerName: user.name,
+              customerPhone: user.phone,
+              createdAt: new Date(),
+              lastMessageAt: new Date(),
+              lastMessage: message.length > 50 ? message.substring(0, 50) + '...' : message,
+              unreadCount: 1,
+              type: 'individual',
+              isBroadcast: true
+            };
+            
+            const convResult = await conversationsCollection.insertOne(conversation);
+            conversation._id = convResult.insertedId;
+          }
+
+          // Save broadcast message in messages collection
+          const userMessage = {
+            conversationId: conversation._id.toString(),
+            message: message,
+            senderId: adminUser._id.toString(),
+            senderRole: 'admin',
+            messageType: 'text',
+            isBroadcast: true,
+            broadcastId: broadcastMessage._id.toString(),
+            createdAt: new Date(),
+            read: false
+          };
+
+          await messagesCollection.insertOne(userMessage);
+
+          // Update conversation
+          await conversationsCollection.updateOne(
+            { _id: conversation._id },
+            { 
+              $set: { 
+                lastMessage: message.length > 50 ? message.substring(0, 50) + '...' : message,
+                lastMessageAt: new Date(),
+                unreadCount: (conversation.unreadCount || 0) + 1
+              }
+            }
+          );
+
+          // Notify user via socket if online
+          const onlineUser = [...onlineUsers.entries()].find(([_, u]) => u.userId === user._id.toString());
+          if (onlineUser) {
+            const [socketId, userData] = onlineUser;
+            io.to(socketId).emit('new_message', {
+              conversationId: conversation._id.toString(),
+              message: userMessage
+            });
+            
+            // Update conversations list
+            io.to(socketId).emit('conversations_update', {
+              conversations: [conversation]
+            });
+          }
+        }
+
+      } catch (error) {
+        console.error(`Failed to send notification to ${user.username}:`, error);
+        failedTokens.push({
+          userId: user._id.toString(),
+          username: user.username,
+          error: error.message
+        });
+        
+        fcmResults.push({
+          userId: user._id.toString(),
+          username: user.username,
+          success: false,
+          error: error.message
+        });
+      }
+    }
+
+    // Update broadcast message with results
+    await messagesCollection.updateOne(
+      { _id: broadcastMessage._id },
+      {
+        $set: {
+          fcmResults: fcmResults,
+          failedCount: failedTokens.length,
+          successCount: fcmResults.filter(r => r.success).length,
+          status: failedTokens.length > 0 ? 'partial' : 'complete'
+        }
+      }
+    );
+
+    // Return response
+    res.json({
+      success: true,
+      message: 'Broadcast message sent successfully',
+      data: {
+        messageId: broadcastMessage._id.toString(),
+        title: title,
+        message: message,
+        sentAt: broadcastMessage.sentAt,
+        totalRecipients: users.length,
+        successCount: fcmResults.filter(r => r.success).length,
+        failedCount: failedTokens.length,
+        fcmResults: fcmResults,
+        failedTokens: failedTokens
+      }
+    });
+
+    console.log(`📢 Broadcast sent: ${title} - ${message.substring(0, 50)}...`);
+
+  } catch (error) {
+    console.error('Broadcast message error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to send broadcast message',
+      error: error.message
+    });
+  }
+});
+
+ app.get('/broadcast/interface', (req, res) => {
+  const html = `
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>📢 Broadcast Messages - Admin Panel</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      }
+      
+      body {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        min-height: 100vh;
+        padding: 20px;
+      }
+      
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      
+      .header {
+        background: rgba(255, 255, 255, 0.95);
+        padding: 30px;
+        border-radius: 15px;
+        margin-bottom: 30px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        text-align: center;
+      }
+      
+      .header h1 {
+        color: #333;
+        font-size: 2.5rem;
+        margin-bottom: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 15px;
+      }
+      
+      .header p {
+        color: #666;
+        font-size: 1.1rem;
+      }
+      
+      .content {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 30px;
+      }
+      
+      @media (max-width: 768px) {
+        .content {
+          grid-template-columns: 1fr;
+        }
+      }
+      
+      .card {
+        background: white;
+        border-radius: 15px;
+        padding: 30px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+      }
+      
+      .card h2 {
+        color: #333;
+        margin-bottom: 20px;
+        padding-bottom: 15px;
+        border-bottom: 2px solid #f0f0f0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      
+      .form-group {
+        margin-bottom: 20px;
+      }
+      
+      label {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: 600;
+        color: #444;
+      }
+      
+      input[type="text"], textarea, select {
+        width: 100%;
+        padding: 15px;
+        border: 2px solid #e0e0e0;
+        border-radius: 8px;
+        font-size: 16px;
+        transition: border-color 0.3s;
+      }
+      
+      input[type="text"]:focus, textarea:focus, select:focus {
+        outline: none;
+        border-color: #667eea;
+      }
+      
+      textarea {
+        min-height: 150px;
+        resize: vertical;
+      }
+      
+      .btn {
+        padding: 15px 30px;
+        border: none;
+        border-radius: 8px;
+        font-size: 16px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.3s;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        width: 100%;
+      }
+      
+      .btn-primary {
+        background: linear-gradient(to right, #667eea, #764ba2);
+        color: white;
+      }
+      
+      .btn-primary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+      }
+      
+      .btn-danger {
+        background: linear-gradient(to right, #ff416c, #ff4b2b);
+        color: white;
+        margin-top: 10px;
+      }
+      
+      .btn-danger:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(255, 65, 108, 0.4);
+      }
+      
+      .status-message {
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+        display: none;
+        font-weight: 500;
+      }
+      
+      .success {
+        background: #d4edda;
+        color: #155724;
+        border: 1px solid #c3e6cb;
+        display: block;
+      }
+      
+      .error {
+        background: #f8d7da;
+        color: #721c24;
+        border: 1px solid #f5c6cb;
+        display: block;
+      }
+      
+      .history-item {
+        background: #f8f9fa;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 15px;
+        border-left: 4px solid #667eea;
+      }
+      
+      .history-item h4 {
+        color: #333;
+        margin-bottom: 10px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      
+      .history-message {
+        color: #555;
+        margin-bottom: 10px;
+        line-height: 1.5;
+      }
+      
+      .history-meta {
+        display: flex;
+        justify-content: space-between;
+        font-size: 14px;
+        color: #888;
+      }
+      
+      .stats {
+        background: linear-gradient(to right, #4CAF50, #8BC34A);
+        color: white;
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+      }
+      
+      .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 15px;
+        text-align: center;
+      }
+      
+      .stat-item {
+        padding: 15px;
+        background: rgba(255, 255, 255, 0.2);
+        border-radius: 8px;
+      }
+      
+      .stat-number {
+        font-size: 2rem;
+        font-weight: bold;
+        margin-bottom: 5px;
+      }
+      
+      .stat-label {
+        font-size: 0.9rem;
+        opacity: 0.9;
+      }
+      
+      .loading {
+        display: none;
+        text-align: center;
+        padding: 20px;
+      }
+      
+      .spinner {
+        border: 4px solid #f3f3f3;
+        border-top: 4px solid #667eea;
+        border-radius: 50%;
+        width: 40px;
+        height: 40px;
+        animation: spin 1s linear infinite;
+        margin: 0 auto 15px;
+      }
+      
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      
+      .emoji {
+        font-size: 1.5em;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1><span class="emoji">📢</span> Broadcast Messages</h1>
+        <p>Send important announcements to all users with push notifications</p>
+      </div>
+      
+      <div class="content">
+        <!-- Send Broadcast Form -->
+        <div class="card">
+          <h2><span class="emoji">✉️</span> Send New Broadcast</h2>
+          
+          <div id="statusMessage" class="status-message"></div>
+          
+          <form id="broadcastForm">
+            <div class="form-group">
+              <label for="title">Notification Title</label>
+              <input type="text" id="title" name="title" placeholder="e.g., Important Update" value="Important Announcement" required>
+            </div>
+            
+            <div class="form-group">
+              <label for="message">Message Content *</label>
+              <textarea id="message" name="message" placeholder="Type your announcement here..." required></textarea>
+            </div>
+            
+            <div class="form-group">
+              <label for="imageUrl">Image URL (Optional)</label>
+              <input type="text" id="imageUrl" name="imageUrl" placeholder="https://example.com/image.jpg">
+              <small style="color: #888; margin-top: 5px; display: block;">For rich notifications with images</small>
+            </div>
+            
+            <div class="form-group">
+              <label for="priority">Notification Priority</label>
+              <select id="priority" name="priority">
+                <option value="high">High Priority (Sound + Vibrate)</option>
+                <option value="normal" selected>Normal Priority</option>
+              </select>
+            </div>
+            
+            <div class="loading" id="loading">
+              <div class="spinner"></div>
+              <p>Sending broadcast to all users...</p>
+            </div>
+            
+            <button type="submit" class="btn btn-primary">
+              <span class="emoji">🚀</span> Send Broadcast Now
+            </button>
+          </form>
+        </div>
+        
+        <!-- Broadcast History -->
+        <div class="card">
+          <h2><span class="emoji">📋</span> Broadcast History</h2>
+          
+          <div class="stats" id="statsContainer">
+            <!-- Stats will be loaded here -->
+          </div>
+          
+          <div id="historyContainer">
+            <!-- History will be loaded here -->
+          </div>
+          
+          <div class="loading" id="historyLoading">
+            <div class="spinner"></div>
+            <p>Loading broadcast history...</p>
+          </div>
+          
+          <button onclick="loadHistory()" class="btn btn-primary">
+            <span class="emoji">🔄</span> Refresh History
+          </button>
+        </div>
+      </div>
+    </div>
+    
+    <script>
+      // API Base URL
+      const API_BASE = '/';
+      
+      // DOM Elements
+      const broadcastForm = document.getElementById('broadcastForm');
+      const statusMessage = document.getElementById('statusMessage');
+      const loading = document.getElementById('loading');
+      const historyContainer = document.getElementById('historyContainer');
+      const historyLoading = document.getElementById('historyLoading');
+      const statsContainer = document.getElementById('statsContainer');
+      
+      // Show status message
+      function showStatus(message, type) {
+        statusMessage.textContent = message;
+        statusMessage.className = 'status-message ' + type;
+        statusMessage.style.display = 'block';
+        
+        // Auto-hide success messages after 5 seconds
+        if (type === 'success') {
+          setTimeout(() => {
+            statusMessage.style.display = 'none';
+          }, 5000);
+        }
+      }
+      
+      // Send broadcast message
+      async function sendBroadcast(e) {
+        e.preventDefault();
+        
+        const title = document.getElementById('title').value;
+        const message = document.getElementById('message').value;
+        const imageUrl = document.getElementById('imageUrl').value;
+        const priority = document.getElementById('priority').value;
+        
+        if (!message.trim()) {
+          showStatus('Please enter a message', 'error');
+          return;
+        }
+        
+        // Show loading
+        loading.style.display = 'block';
+        
+        try {
+          const response = await fetch('/broadcast', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              title: title,
+              message: message,
+              imageUrl: imageUrl || null,
+              priority: priority
+            })
+          });
+          
+          const data = await response.json();
+          
+          if (data.success) {
+            showStatus('Broadcast sent successfully!', 'success');
+            broadcastForm.reset();
+            document.getElementById('title').value = 'Important Announcement';
+            
+            // Show statistics
+            showBroadcastStats(data.data);
+            
+            // Reload history
+            loadHistory();
+          } else {
+            showStatus('Error: ' + data.message, 'error');
+          }
+        } catch (error) {
+          showStatus('Network error: ' + error.message, 'error');
+        } finally {
+          loading.style.display = 'none';
+        }
+      }
+      
+      // Load broadcast history
+      async function loadHistory() {
+        historyLoading.style.display = 'block';
+        historyContainer.innerHTML = '';
+        
+        try {
+          const response = await fetch(API_BASE + '/broadcast/history');
+          const data = await response.json();
+          
+          if (data.success) {
+            displayBroadcastHistory(data.broadcasts);
+          } else {
+            historyContainer.innerHTML = '<div class="error">Failed to load history</div>';
+          }
+        } catch (error) {
+          historyContainer.innerHTML = '<div class="error">Network error: ' + error.message + '</div>';
+        } finally {
+          historyLoading.style.display = 'none';
+        }
+      }
+      
+      // Display broadcast history
+      function displayBroadcastHistory(broadcasts) {
+        if (!broadcasts || broadcasts.length === 0) {
+          historyContainer.innerHTML = '<div class="history-item"><p>No broadcast messages yet.</p></div>';
+          return;
+        }
+        
+        let html = '';
+        
+        broadcasts.forEach(broadcast => {
+          const sentDate = new Date(broadcast.sentAt).toLocaleString();
+          const successCount = broadcast.successCount || 0;
+          const failedCount = broadcast.failedCount || 0;
+          const total = broadcast.totalRecipients || 0;
+          
+          html += \`
+            <div class="history-item">
+              <h4>
+                \${broadcast.title}
+                <span style="font-size: 12px; background: #e0e0e0; padding: 2px 8px; border-radius: 10px;">
+                  \${successCount}/\${total} sent
+                </span>
+              </h4>
+              <div class="history-message">\${broadcast.message}</div>
+              <div class="history-meta">
+                <span>\${sentDate}</span>
+                <span>
+                  ✅ \${successCount} | ❌ \${failedCount}
+                </span>
+              </div>
+              <button onclick="deleteBroadcast('\${broadcast._id}')" 
+                      class="btn btn-danger" 
+                      style="margin-top: 10px; padding: 8px 15px; font-size: 14px;">
+                <span class="emoji">🗑️</span> Delete
+              </button>
+            </div>
+          \`;
+        });
+        
+        historyContainer.innerHTML = html;
+      }
+      
+      // Show broadcast statistics
+      function showBroadcastStats(data) {
+        statsContainer.innerHTML = \`
+          <div class="stats-grid">
+            <div class="stat-item">
+              <div class="stat-number">\${data.totalRecipients}</div>
+              <div class="stat-label">Total Users</div>
+            </div>
+            <div class="stat-item">
+              <div class="stat-number">\${data.successCount}</div>
+              <div class="stat-label">Successful</div>
+            </div>
+            <div class="stat-item">
+              <div class="stat-number">\${data.failedCount}</div>
+              <div class="stat-label">Failed</div>
+            </div>
+          </div>
+          <div style="margin-top: 10px; text-align: center; font-size: 14px;">
+            📊 Message ID: \${data.messageId.substring(0, 8)}...
+          </div>
+        \`;
+      }
+      
+      // Delete broadcast
+      async function deleteBroadcast(id) {
+        if (!confirm('Are you sure you want to delete this broadcast?')) return;
+        
+        try {
+          const response = await fetch(API_BASE + '/broadcast/' + id, {
+            method: 'DELETE'
+          });
+          
+          const data = await response.json();
+          
+          if (data.success) {
+            showStatus('Broadcast deleted successfully!', 'success');
+            loadHistory();
+          } else {
+            showStatus('Error: ' + data.message, 'error');
+          }
+        } catch (error) {
+          showStatus('Network error: ' + error.message, 'error');
+        }
+      }
+      
+      // Event Listeners
+      broadcastForm.addEventListener('submit', sendBroadcast);
+      
+      // Load history on page load
+      document.addEventListener('DOMContentLoaded', () => {
+        loadHistory();
+        
+        // Show welcome message
+        setTimeout(() => {
+          showStatus('Ready to send broadcast messages!', 'success');
+        }, 1000);
+      });
+    </script>
+  </body>
+  </html>
+  `;
+  
+  res.send(html);
+});
+
+
+
+
+
 // FCM Message Function for individual chats
 async function sendFCMMessage(messageData) {
   try {
@@ -753,6 +1529,51 @@ io.on('connection', (socket) => {
         username: user.username,
         role: user.role
       });
+
+
+
+
+
+ // ===============================
+    // 🔥 AUTO CREATE ADMIN CONVERSATION
+    // ===============================
+    if (user.role === 'customer') {
+      const admin = await usersCollection.findOne({ role: 'admin' });
+
+      if (admin) {
+        const existingConversation = await conversationsCollection.findOne({
+          adminId: admin._id.toString(),
+          customerId: user._id.toString(),
+          type: 'individual'
+        });
+
+        // ❌ Missing → Create new
+        if (!existingConversation) {
+          await conversationsCollection.insertOne({
+            adminId: admin._id.toString(),
+            customerId: user._id.toString(),
+            customerUsername: user.username,
+            customerName: user.name,
+            customerPhone: user.phone,
+            createdAt: new Date(),
+            lastMessageAt: new Date(),
+            lastMessage: 'Conversation started',
+            unreadCount: 0,
+            type: 'individual'
+          });
+        }
+      }
+    }
+
+
+
+
+
+
+
+
+
+
       
       // Get user's conversations (individual and group)
       let individualConversations = await conversationsCollection
@@ -826,6 +1647,106 @@ io.on('connection', (socket) => {
       socket.emit('messages_error', { message: 'Failed to load messages' });
     }
   });
+
+
+
+
+
+
+socket.on('rename_group', async (data) => {
+  try {
+    const { groupId, name, description } = data;
+    const user = onlineUsers.get(socket.id);
+    
+    if (!user || user.role !== 'admin') {
+      socket.emit('group_error', { message: 'Only admins can rename groups' });
+      return;
+    }
+
+    const groupsCollection = db.collection('groups');
+    const conversationsCollection = db.collection('conversations');
+    const groupMembersCollection = db.collection('group_members');
+
+    // Verify group exists and user is the creator/admin
+    const group = await groupsCollection.findOne({ 
+      _id: new ObjectId(groupId),
+      createdBy: user.userId
+    });
+
+    if (!group) {
+      socket.emit('group_error', { message: 'Group not found or access denied' });
+      return;
+    }
+
+    // Update group name and description
+    const updateData = {
+      name: name,
+      updatedAt: new Date()
+    };
+
+    if (description !== undefined) {
+      updateData.description = description;
+    }
+
+    await groupsCollection.updateOne(
+      { _id: new ObjectId(groupId) },
+      { $set: updateData }
+    );
+
+    // Update group conversation name
+    await conversationsCollection.updateOne(
+      { groupId: groupId },
+      { 
+        $set: { 
+          groupName: name,
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    // Get all group members
+    const groupMembers = await groupMembersCollection.find({
+      groupId: groupId
+    }).toArray();
+
+    // Notify all group members about the rename
+    const memberSockets = getSocketsByUserIds(groupMembers.map(m => m.userId));
+    memberSockets.forEach(memberSocket => {
+      io.to(memberSocket.socketId).emit('group_renamed', {
+        groupId: groupId,
+        oldName: group.name,
+        newName: name,
+        description: description,
+        renamedBy: user.username,
+        timestamp: new Date()
+      });
+    });
+
+    // Update conversations for all members
+    updateConversationsForUsers(groupMembers.map(m => m.userId));
+
+    console.log(`📝 Group ${groupId} renamed by admin ${user.userId}`);
+
+    socket.emit('group_renamed_success', {
+      groupId: groupId,
+      name: name,
+      description: description
+    });
+
+  } catch (error) {
+    console.error('Rename group error:', error);
+    socket.emit('group_error', { message: 'Failed to rename group' });
+  }
+});
+
+
+
+
+
+
+
+
+
 
 
 
