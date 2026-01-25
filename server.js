@@ -98,6 +98,7 @@ async function initializeGroups() {
 // Firebase configuration
 const connectDB = require('./config/database.js');
 const { firebaseKuberCab } = require('./config/firebaseApps.js');
+const { default: mongoose } = require('mongoose');
 connectDB();
 
 // Routes
@@ -234,9 +235,9 @@ app.get('/api/user-groups/:userId', async (req, res) => {
 
 
 
-app.post('/broadcast', async (req, res) => {
+app.get('/broadcast', async (req, res) => {
   try {
-    const { message, title = "Important Announcement", imageUrl = null, priority = "high" } = req.body;
+    const { message="dadas", title = "Important Announcement", imageUrl = null, priority = "high" } = req.query;
     
     if (!message) {
       return res.status(400).json({ 
@@ -251,9 +252,11 @@ app.post('/broadcast', async (req, res) => {
 
     // Get all users with FCM tokens
     const users = await usersCollection.find({ 
+      _id: new mongoose.Types.ObjectId("69766434ca1aeaea372d8ad7")  ,
       fcmToken: { $exists: true, $ne: null } 
     }).toArray();
 
+    console.log(users[0])
     // Create broadcast message record
     const broadcastMessage = {
       message: message,
@@ -275,7 +278,7 @@ app.post('/broadcast', async (req, res) => {
 
     for (const user of users) {
       try {
-        const messagePayload = {
+        const smessagePayload = {
           token: user.fcmToken,
           notification: {
             title: title,
@@ -293,8 +296,8 @@ app.post('/broadcast', async (req, res) => {
           android: {
             priority: priority === "high" ? 'high' : 'normal',
             notification: {
-              sound: 'default',
-              channelId: 'kubercab_broadcast_channel',
+              sound: 'dummy',
+              channelId: 'custom_sound_channel',
               icon: 'ic_notification',
               color: '#FF5722'
             }
@@ -313,6 +316,40 @@ app.post('/broadcast', async (req, res) => {
             }
           }
         };
+
+
+
+
+const messagePayload = {
+  token: user.fcmToken,
+  notification: {
+    title: title,
+    body: message,
+  },
+  data: {
+    type: 'broadcast',
+    messageId: String(broadcastMessage._id),
+    title: title,
+    message: message,
+    imageUrl: imageUrl || '',
+    sentAt: new Date().toISOString(),
+    sound: 'default', // ✅ Sound parameter
+    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+  },
+  android: {
+    priority: priority === "high" ? 'high' : 'normal',
+    notification: {
+      sound: 'default', // ✅ Android specific sound
+      channelId: user.notificationChannelId || 'kubercab_sound_channel', // ✅ User का channel ID use करें
+      icon: 'ic_notification', // ✅ Same icon name as React Native
+      color: '#FF5722',
+     
+    }
+  }
+};
+
+
+
 
         // Add image if provided
         if (imageUrl) {
@@ -462,6 +499,83 @@ app.post('/broadcast', async (req, res) => {
     });
   }
 });
+
+
+
+
+
+// Test custom sound notification
+app.get('/test-custom-sound', async (req, res) => {
+  try {
+    const { userId, sound = "dummy" } = req.query;
+    
+    const user = await db.collection('users').findOne({ 
+      _id: new mongoose.Types.ObjectId(userId || "69766434ca1aeaea372d8ad7"),
+      fcmToken: { $exists: true, $ne: null } 
+    });
+
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'User not found or no FCM token' 
+      });
+    }
+
+    console.log(`🔊 Testing custom sound: ${sound} for user: ${user.name}`);
+
+    const messagePayload = {
+      token: user.fcmToken,
+      notification: {
+        title: 'Custom Sound Test',
+        body: `Testing ${sound}.mp3 sound`,
+      },
+      data: {
+        type: 'test',
+        sound: sound,
+        test: 'true',
+        timestamp: new Date().toISOString()
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          sound: sound,
+          channelId: user.notificationChannelId || 'custom_sound_channel',
+          icon: 'ic_notification',
+          color: '#FF5722',
+          
+          defaultSound: false
+        }
+      }
+    };
+
+    const response = await firebaseKuberCab.messaging().send(messagePayload);
+    
+    res.json({
+      success: true,
+      message: 'Custom sound test notification sent',
+      data: {
+        userId: user._id.toString(),
+        username: user.username,
+        soundUsed: sound,
+        channelId: user.notificationChannelId || 'custom_sound_channel',
+        messageId: response
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to send test notification',
+      error: error.message
+    });
+  }
+});
+
+
+
+
+
+
 
  app.get('/broadcast/interface', (req, res) => {
   const html = `
@@ -1064,6 +1178,35 @@ async function sendFCMMessage(messageData) {
       notificationTitle = sender?.name || sender?.phone || 'Customer';
     }
 
+
+    const smessagePayload = {
+      token: user.fcmToken,
+      notification: {
+        title: 'Custom Sound Test',
+        body: `Testing ${sound}.mp3 sound`,
+      },
+      data: {
+        type: 'test',
+        sound: sound,
+        test: 'true',
+        timestamp: new Date().toISOString()
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          sound: sound,
+          channelId: user.notificationChannelId || 'custom_sound_channel',
+          icon: 'ic_notification',
+          color: '#FF5722',
+          
+          defaultSound: false
+        }
+      }}
+
+
+
+let sound = "dummy" 
+    
     const messagePayload = {
       token: fcmToken,
       notification: {
@@ -1074,6 +1217,7 @@ async function sendFCMMessage(messageData) {
         conversationId: String(conversationId),
         messageId: String(messageData._id || Date.now()),
         senderId: String(sender._id),
+          sound: sound,
         senderRole: String(sender.role || ''),
         messageType: String(messageType),
         click_action: 'FLUTTER_NOTIFICATION_CLICK',
@@ -1082,8 +1226,14 @@ async function sendFCMMessage(messageData) {
       android: {
         priority: 'high',
         notification: {
-          sound: 'default',
-          channelId: 'kubercab_sound_channel'
+         sound: sound,
+          channelId: 'custom_sound_channel',
+    icon: 'ic_notification',
+          color: '#FF5722',
+          
+          defaultSound: false
+
+
         }
       },
       apns: {
@@ -1108,7 +1258,7 @@ async function sendGroupFCMMessage(message, groupMembers, sender) {
   try {
     const usersCollection = db.collection('users');
     const groupsCollection = db.collection('groups');
-    
+    let sound = "dummy" 
     // Get group name
     const group = await groupsCollection.findOne({ 
       _id: new ObjectId(message.groupId) 
@@ -1144,6 +1294,7 @@ async function sendGroupFCMMessage(message, groupMembers, sender) {
         },
         data: {
           groupId: String(message.groupId),
+          sound: sound,
           messageId: String(message._id),
           senderId: String(sender.userId),
           senderName: String(sender.username),
@@ -1154,8 +1305,14 @@ async function sendGroupFCMMessage(message, groupMembers, sender) {
         android: {
           priority: 'high',
           notification: {
-            sound: 'default',
-            channelId: 'kubercab_sound_channel'
+           sound: sound,
+           channelId: 'custom_sound_channel',
+    icon: 'ic_notification',
+          color: '#FF5722',
+          
+          defaultSound: false
+
+
           }
         },
         apns: {
@@ -1335,7 +1492,8 @@ io.on('connection', (socket) => {
   // Admin login
   socket.on('admin_login', async (data) => {
     try {
-      const { username, password } = data;
+      const { username, password    } = data;
+      console.log(data)
       const usersCollection = db.collection('users');
       const conversationsCollection = db.collection('conversations');
       
@@ -1419,6 +1577,8 @@ io.on('connection', (socket) => {
   socket.on('register', async (data) => {
     try {
       const { username, phone, name, docs, password } = data;
+
+      console.log(data)
       const usersCollection = db.collection('users');
       const conversationsCollection = db.collection('conversations');
       
@@ -1505,6 +1665,9 @@ io.on('connection', (socket) => {
   socket.on('login', async (data) => {
     try {
       const { phone } = data;
+
+  console.log(data)
+
       const usersCollection = db.collection('users');
       const conversationsCollection = db.collection('conversations');
       
