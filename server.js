@@ -1928,8 +1928,8 @@ socket.on('get_conversations', async (data) => {
 
     const conversationsCollection = db.collection('conversations');
     const messagesCollection = db.collection('messages');
-    
-    const skip = (page - 1) * limit;
+    const finalPage = user.role !== 'admin' ? 1 : page;
+    const skip = (finalPage  - 1) * limit;
     
     // Step 1: Get all conversation IDs for this user
     const individualQuery = {
